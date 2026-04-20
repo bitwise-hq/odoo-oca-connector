@@ -1,0 +1,311 @@
+name: Sync fork from upstream
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to sync. Leave empty to sync all shared X.0 branches.
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPOSITORY: OCA/connector
+  CONFLICT_LABEL: upstream-sync-conflict
+
+jobs:
+  discover-branches:
+    runs-on: ubuntu-latest
+    outputs:
+      branches: ${{ steps.discover.outputs.branches }}
+
+    steps:
+      - name: Discover shared version branches
+        id: discover
+        shell: bash
+        env:
+          REQUESTED_BRANCH: ${{ github.event.inputs.branch || '' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${REQUESTED_BRANCH}" ]; then
+            if [[ ! "${REQUESTED_BRANCH}" =~ ^[0-9]+\.0$ ]]; then
+              echo "Manual branch input must match X.0, got: ${REQUESTED_BRANCH}" >&2
+              exit 1
+            fi
+
+            branches_json="[\"${REQUESTED_BRANCH}\"]"
+            echo "branches=${branches_json}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t origin_branches < <(
+            git ls-remote --heads "https://github.com/${GITHUB_REPOSITORY}.git" \
+              | awk '{print $2}' \
+              | sed 's|refs/heads/||' \
+              | grep -E '^[0-9]+\.0$' \
+              | sort -V
+          )
+
+          mapfile -t upstream_branches < <(
+            git ls-remote --heads "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+              | awk '{print $2}' \
+              | sed 's|refs/heads/||' \
+              | grep -E '^[0-9]+\.0$' \
+              | sort -V
+          )
+
+          mapfile -t shared_branches < <(
+            comm -12 \
+              <(printf '%s\n' "${origin_branches[@]}" | sort -V) \
+              <(printf '%s\n' "${upstream_branches[@]}" | sort -V)
+          )
+
+          if [ "${#shared_branches[@]}" -eq 0 ]; then
+            echo "No shared X.0 branches found between ${GITHUB_REPOSITORY} and ${UPSTREAM_REPOSITORY}." >&2
+            exit 1
+          fi
+
+          branches_json="$(printf '%s\n' "${shared_branches[@]}" | jq -R . | jq -s -c .)"
+          echo "branches=${branches_json}" >> "$GITHUB_OUTPUT"
+
+  sync:
+    needs: discover-branches
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.discover-branches.outputs.branches) }}
+    concurrency:
+      group: sync-upstream-${{ matrix.branch }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream changes
+        id: sync
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ matrix.branch }}
+          UPSTREAM_BRANCH: ${{ matrix.branch }}
+        run: |
+          set -euo pipefail
+
+          issue_title="[sync] Manual upstream merge required for ${TARGET_BRANCH}"
+          issue_body_path="${RUNNER_TEMP}/upstream-sync-conflict.md"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git" 2> /dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+
+          git fetch --no-tags origin "${TARGET_BRANCH}"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
+
+          before_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+          {
+            echo "target_branch=${TARGET_BRANCH}"
+            echo "upstream_branch=${UPSTREAM_BRANCH}"
+            echo "before_sha=${before_sha}"
+            echo "upstream_sha=${upstream_sha}"
+            echo "issue_title=${issue_title}"
+            echo "issue_body_path=${issue_body_path}"
+            echo "run_url=${run_url}"
+          } >> "$GITHUB_OUTPUT"
+
+          if git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            after_sha="$(git rev-parse HEAD)"
+            echo "after_sha=${after_sha}" >> "$GITHUB_OUTPUT"
+
+            if [ "${after_sha}" = "${before_sha}" ]; then
+              echo "result=no_changes" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            git push origin "HEAD:${TARGET_BRANCH}"
+            echo "result=pushed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          conflict_files="$(git diff --name-only --diff-filter=U || true)"
+          compare_log="$(git log --oneline --left-right --boundary "origin/${TARGET_BRANCH}...upstream/${UPSTREAM_BRANCH}" | head -n 50 || true)"
+
+          {
+            echo "# Upstream sync conflict"
+            echo
+            echo "Automatic sync from ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} into ${GITHUB_REPOSITORY}:${TARGET_BRANCH} failed."
+            echo
+            echo "- Target branch: \`${TARGET_BRANCH}\`"
+            echo "- Upstream branch: \`${UPSTREAM_BRANCH}\`"
+            echo "- Fork head before merge: \`${before_sha}\`"
+            echo "- Upstream head: \`${upstream_sha}\`"
+            echo "- Workflow run: ${run_url}"
+            echo
+            echo "## Conflicting files"
+            echo
+            if [ -n "${conflict_files}" ]; then
+              printf '%s\n' "${conflict_files}" | sed 's/^/- `/' | sed 's/$/`/'
+            else
+              echo "- Conflict details were not available."
+            fi
+            echo
+            echo "## Divergence summary"
+            echo
+            echo '```text'
+            if [ -n "${compare_log}" ]; then
+              printf '%s\n' "${compare_log}"
+            else
+              echo "No divergence summary available."
+            fi
+            echo '```'
+            echo
+            echo "Manual resolution is required before automated sync can resume."
+          } > "${issue_body_path}"
+
+          git merge --abort || true
+          echo "result=conflict" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update conflict issue
+        if: steps.sync.outputs.result == 'conflict'
+        uses: actions/github-script@v7
+        env:
+          ISSUE_TITLE: ${{ steps.sync.outputs.issue_title }}
+          ISSUE_BODY_PATH: ${{ steps.sync.outputs.issue_body_path }}
+          CONFLICT_LABEL: ${{ env.CONFLICT_LABEL }}
+          RUN_URL: ${{ steps.sync.outputs.run_url }}
+        with:
+          script: |
+            const fs = require("fs");
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = process.env.ISSUE_TITLE;
+            const body = fs.readFileSync(process.env.ISSUE_BODY_PATH, "utf8");
+            const label = process.env.CONFLICT_LABEL;
+            const runUrl = process.env.RUN_URL;
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: label,
+                color: "d73a4a",
+                description: "Manual intervention required for upstream sync conflicts",
+              });
+            }
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "all",
+              per_page: 100,
+            });
+
+            const existing = issues.find(
+              (issue) => !issue.pull_request && issue.title === title,
+            );
+
+            if (existing) {
+              const labels = new Set((existing.labels || []).map((entry) => typeof entry === "string" ? entry : entry.name));
+              labels.add(label);
+
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                title,
+                body,
+                state: "open",
+                labels: [...labels],
+              });
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body: `Conflict detected again in ${runUrl}`,
+              });
+
+              core.info(`Updated issue #${existing.number}`);
+              return;
+            }
+
+            const created = await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+              labels: [label],
+            });
+
+            core.info(`Created issue #${created.data.number}`);
+
+      - name: Close resolved conflict issue
+        if: steps.sync.outputs.result == 'pushed' || steps.sync.outputs.result == 'no_changes'
+        uses: actions/github-script@v7
+        env:
+          ISSUE_TITLE: ${{ steps.sync.outputs.issue_title }}
+          CONFLICT_LABEL: ${{ env.CONFLICT_LABEL }}
+          RUN_URL: ${{ steps.sync.outputs.run_url }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = process.env.ISSUE_TITLE;
+            const label = process.env.CONFLICT_LABEL;
+            const runUrl = process.env.RUN_URL;
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "open",
+              labels: label,
+              per_page: 100,
+            });
+
+            const existing = issues.find(
+              (issue) => !issue.pull_request && issue.title === title,
+            );
+
+            if (!existing) {
+              core.info("No open conflict issue to close.");
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: existing.number,
+              body: `Sync completed successfully in ${runUrl}. Closing this issue.`,
+            });
+
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number: existing.number,
+              state: "closed",
+            });
+
+            core.info(`Closed issue #${existing.number}`);
