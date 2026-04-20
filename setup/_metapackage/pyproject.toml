@@ -4,6 +4,7 @@ version = "19.0.20260420.1"
 dependencies = [
     "odoo-addon-component==19.0.*",
     "odoo-addon-component_event==19.0.*",
+    "odoo-addon-connector_lifecycle==19.0.*",
 ]
 classifiers=[
     "Programming Language :: Python",

@@ -1,0 +1,2 @@
+- Bitwise Technologies LLC
+- Youssef Egla
